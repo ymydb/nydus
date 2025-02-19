@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/reference/docker"
 	"github.com/containerd/nydus-snapshotter/pkg/converter"
@@ -105,6 +106,17 @@ func (cm *Committer) Commit(ctx context.Context, opt Opt) error {
 	}
 	if opt.FsVersion, opt.Compressor, err = cm.obtainBootStrapInfo(ctx, "bootstrap-base"); err != nil {
 		return errors.Wrap(err, "obtain bootstrap FsVersion and Compressor")
+	}
+
+	lowerBlobLayers := []ocispec.Descriptor{}
+	for idx := range image.Manifest.Layers {
+		layer := image.Manifest.Layers[idx]
+		if layer.MediaType == utils.MediaTypeNydusBlob {
+			lowerBlobLayers = append(lowerBlobLayers, layer)
+		}
+	}
+	if err := cm.copyLowerBlobLayers(ctx, inspect.Image, lowerBlobLayers, targetRef, opt.TargetInsecure); err != nil {
+		return errors.Wrap(err, "copy lower blob layers")
 	}
 
 	mountList := NewMountList()
@@ -218,7 +230,7 @@ func (cm *Committer) Commit(ctx context.Context, opt Opt) error {
 	}
 
 	logrus.Infof("pushing committed image to %s", targetRef)
-	if err := cm.pushManifest(ctx, *image, *bootstrapDiffID, targetRef, "bootstrap-merged.tar", opt.FsVersion, upperBlob, mountBlobs, opt.TargetInsecure); err != nil {
+	if err := cm.pushManifest(ctx, *image, *bootstrapDiffID, targetRef, "bootstrap-merged.tar", opt.FsVersion, upperBlob, mountBlobs, opt.TargetInsecure, inspect.Image); err != nil {
 		return errors.Wrap(err, "push manifest")
 	}
 
@@ -368,7 +380,7 @@ func (cm *Committer) pause(ctx context.Context, containerID string, handle func(
 }
 
 func (cm *Committer) pushManifest(
-	ctx context.Context, nydusImage parserPkg.Image, bootstrapDiffID digest.Digest, targetRef, bootstrapName, fsversion string, upperBlob *Blob, mountBlobs []Blob, insecure bool,
+	ctx context.Context, nydusImage parserPkg.Image, bootstrapDiffID digest.Digest, targetRef, bootstrapName, fsversion string, upperBlob *Blob, mountBlobs []Blob, insecure bool, sourceRef string,
 ) error {
 	lowerBlobLayers := []ocispec.Descriptor{}
 	for idx := range nydusImage.Manifest.Layers {
@@ -376,6 +388,11 @@ func (cm *Committer) pushManifest(
 		if layer.MediaType == utils.MediaTypeNydusBlob {
 			lowerBlobLayers = append(lowerBlobLayers, layer)
 		}
+	}
+
+	remoter, err := provider.DefaultRemote(targetRef, insecure)
+	if err != nil {
+		return errors.Wrap(err, "create remote")
 	}
 
 	// Push image config
@@ -395,11 +412,6 @@ func (cm *Committer) pushManifest(
 	configBytes, configDesc, err := cm.makeDesc(config, nydusImage.Manifest.Config)
 	if err != nil {
 		return errors.Wrap(err, "make config desc")
-	}
-
-	remoter, err := provider.DefaultRemote(targetRef, insecure)
-	if err != nil {
-		return errors.Wrap(err, "create remote")
 	}
 
 	if err := remoter.Push(ctx, *configDesc, true, bytes.NewReader(configBytes)); err != nil {
@@ -485,6 +497,7 @@ func (cm *Committer) pushManifest(
 	if err != nil {
 		return errors.Wrap(err, "make config desc")
 	}
+
 	if err := remoter.Push(ctx, *manifestDesc, false, bytes.NewReader(manifestBytes)); err != nil {
 		return errors.Wrap(err, "push image manifest")
 	}
@@ -702,4 +715,58 @@ func (cm *Committer) obtainBootStrapInfo(ctx context.Context, BootstrapName stri
 		return "", "", errors.Wrapf(err, "unmarshal output json file %s", outputJSONPath)
 	}
 	return output.FsVersion, strings.ToLower(output.Compressor), nil
+}
+
+func (cm *Committer) copyLowerBlobLayers(ctx context.Context, sourceRef string, lowerBlobLayers []ocispec.Descriptor, targetRef string, insecure bool) error {
+	// Skip if source and target repositories are the same
+	if sourceRef == targetRef {
+		return nil
+	}
+
+	logrus.Infof("copying layers from %s to %s", sourceRef, targetRef)
+
+	// Create source and target remotes
+	sourceRemoter, err := provider.DefaultRemote(sourceRef, insecure)
+	if err != nil {
+		return errors.Wrap(err, "create source remote")
+	}
+
+	targetRemoter, err := provider.DefaultRemote(targetRef, insecure)
+	if err != nil {
+		return errors.Wrap(err, "create target remote")
+	}
+
+	// Copy layers to target repository
+	for _, layer := range lowerBlobLayers {
+		logrus.Infof("copying layer %s", layer.Digest)
+
+		// Try to use mount API first
+		err := targetRemoter.Mount(ctx, layer, sourceRef)
+		if err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				logrus.Infof("layer %s already exists in target repo", layer.Digest)
+				continue
+			}
+			// If mount fails, fallback to full pull/push
+			logrus.Warnf("mount layer %s failed, fallback to pull/push: %v", layer.Digest, err)
+			reader, err := sourceRemoter.Pull(ctx, layer, true)
+			if err != nil {
+				return errors.Wrapf(err, "pull layer %s from source", layer.Digest)
+			}
+			defer reader.Close()
+
+			if err := targetRemoter.Push(ctx, layer, true, reader); err != nil {
+				if utils.RetryWithHTTP(err) {
+					targetRemoter.MaybeWithHTTP(err)
+					if err := targetRemoter.Push(ctx, layer, true, reader); err != nil {
+						return errors.Wrapf(err, "push layer %s to target", layer.Digest)
+					}
+				} else {
+					return errors.Wrapf(err, "push layer %s to target", layer.Digest)
+				}
+			}
+		}
+	}
+
+	return nil
 }
