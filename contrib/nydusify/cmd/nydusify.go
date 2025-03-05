@@ -1358,7 +1358,11 @@ func main() {
 				}
 				cm, err := committer.NewCommitter(opt)
 				if err != nil {
-					return errors.Wrap(err, "create commiter")
+					return errors.Wrap(err, "failed to create committer instance")
+				}
+				// Initialize and update ContainerID to long ID
+				if err := cm.Initialize(c.Context, &opt); err != nil {
+					return errors.Wrap(err, "failed to initialize committer with container ID")
 				}
 				return cm.Commit(c.Context, opt)
 			},

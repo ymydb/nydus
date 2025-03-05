@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/labels"
 
 	"github.com/containerd/containerd/content/local"
@@ -844,4 +845,90 @@ func (cm *Committer) obtainBootStrapInfo(ctx context.Context, BootstrapName stri
 		return "", "", errors.Wrapf(err, "unmarshal output json file %s", outputJSONPath)
 	}
 	return output.FsVersion, strings.ToLower(output.Compressor), nil
+}
+
+// Constants for container operations
+const (
+	// DefaultNamespace is the default containerd namespace
+	DefaultNamespace = "default"
+	// MaxContainerIDLength is the maximum length of a container ID
+	MaxContainerIDLength = 64
+)
+
+// Initialize initializes the committer with the given options
+func (cm *Committer) Initialize(ctx context.Context, opt *Opt) error {
+	if opt == nil {
+		return errors.New("invalid options: options cannot be nil")
+	}
+	if opt.ContainerID == "" {
+		return errors.New("invalid container ID: container ID cannot be empty")
+	}
+	if len(opt.ContainerID) > MaxContainerIDLength {
+		return fmt.Errorf("invalid container ID length: exceeds maximum length of %d", MaxContainerIDLength)
+	}
+
+	fullContainerID, err := cm.resolveFullContainerID(ctx, *opt)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve full container ID")
+	}
+	opt.ContainerID = fullContainerID
+	logrus.Debugf("Successfully initialized committer with container ID: %s", fullContainerID)
+	return nil
+}
+
+func (cm *Committer) resolveFullContainerID(ctx context.Context, opt Opt) (string, error) {
+	client, err := containerd.New(opt.ContainerdAddress)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to create containerd client")
+	}
+	defer client.Close()
+
+	// Use the specified namespace for container operations
+	nsCtx := namespaces.WithNamespace(ctx, opt.Namespace)
+
+	// List all containers in the specified namespace
+	containers, err := client.Containers(nsCtx)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to list containers in namespace %s", opt.Namespace)
+	}
+
+	var matchedContainerID string
+	partialID := opt.ContainerID
+	// Remove any prefix if it exists (e.g., "containerd://")
+	if strings.Contains(partialID, "://") {
+		parts := strings.Split(partialID, "://")
+		partialID = parts[len(parts)-1]
+	}
+
+	for _, container := range containers {
+		cid := container.ID()
+		// Match exact ID
+		if cid == partialID {
+			matchedContainerID = cid
+			logrus.Debugf("Exact match found for container ID: %s", matchedContainerID)
+			break
+		}
+		// Match by prefix (full or partial)
+		if strings.HasPrefix(cid, partialID) {
+			if matchedContainerID != "" {
+				return "", fmt.Errorf("ambiguous ID: matches multiple containers for provided ID: %s", partialID)
+			}
+			matchedContainerID = cid
+			logrus.Debugf("Prefix match found for container ID: %s", matchedContainerID)
+		}
+		// Match by suffix
+		if strings.HasSuffix(cid, partialID) {
+			if matchedContainerID != "" {
+				return "", fmt.Errorf("ambiguous ID: matches multiple containers for provided ID: %s", partialID)
+			}
+			matchedContainerID = cid
+			logrus.Debugf("Suffix match found for container ID: %s", matchedContainerID)
+		}
+	}
+
+	if matchedContainerID == "" {
+		return "", fmt.Errorf("no container found for provided ID: %s in namespace %s", partialID, opt.Namespace)
+	}
+
+	return matchedContainerID, nil
 }
